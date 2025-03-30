@@ -34,4 +34,27 @@ class reRankLLM(object):
     # 输入文档对，返回每一对(query, doc)的相关得分，并从大到小排序
     def predict(self, query, docs):
         pairs = [(query, doc.page_content) for doc in docs]
+        inputs = self.tokenizer(pairs, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt").to("cuda")
+        with torch.no_grad():
+            scores = self.model(**inputs).logits
+        scores = scores.detach().cpu().numpy()
+        response = [doc for score, doc in sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)]
+        torch_gc()
+        return response
+    
 
+if __name__ == "__main__":
+    bge_reraker_large = "pre_train_model/bge-reranker-large"
+    reranker = reRankLLM(bge_reraker_large)
+
+    # 示例查询
+    text_path = "all_text.txt"
+    with open(text_path, "r", encoding="utf-8") as f:
+        data_list = f.readlines()
+
+    bm25 = BM25(data_list)
+    res = bm25.getBM25TopK("座椅加热", topk=6)
+
+    reranked_res = reranker.predict("座椅加热", res)
+    print(reranked_res)
+    
