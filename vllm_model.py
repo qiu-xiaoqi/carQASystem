@@ -1,43 +1,25 @@
 import os
 import torch
 import time
-from config import *
+import asyncio
+import multiprocessing as mp
 from vllm import LLM, SamplingParams
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.engine.async_llm_engine import AsyncLLMEngine
+from transformers import AutoTokenizer, GenerationConfig
 
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from transformers import GenerationConfig
-from qwen_generation_utils import make_context, decode_tokens, get_stop_words_ids
-
+# 多进程设置（必须放在最顶部）
+mp.set_start_method('spawn', force=True)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # 确保GPU顺序一致
 
-DEVICE = LLM_DEVICE
-DEVICE_ID = "0"
-CUDA_DEVICE = f"{DEVICE}:{DEVICE_ID}" if DEVICE_ID else DEVICE
-
-IMEND = "<|im_end>|"
-ENDOFTEXT = "<|endoftext|>"
-
-
-def get_stop_words_ids(chat_format, tokenizer):
-    if chat_format == "raw":
-        stop_words_ids = [tokenizer.encode("Human:"), [tokenizer.eod_id]]
-    elif chat_format == "chatml":
-        stop_words_ids = [[tokenizer.im_end_id], [tokenizer.im_start_id]]
-    else:
-        raise NotImplementedError(f"Unknown chat format {chat_format!r}")
-    return stop_words_ids
-
-
-def torch_gc():
-    if torch.cuda.is_available():
-        with torch.cuda.device(CUDA_DEVICE):
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-
-class ChatLLM(object):
-    """
-    """
-    def __init__(self, model_path):
+class Qwen7BChatModel:
+    def __init__(self, model_path, tensor_parallel_size=2):
+        """初始化多GPU LLM引擎"""
+        self.model_path = model_path
+        self.tensor_parallel_size = tensor_parallel_size
+        
+        # 初始化tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
             pad_token='<|extra_0|>',
@@ -45,75 +27,129 @@ class ChatLLM(object):
             padding_side='left',
             trust_remote_code=True
         )
-        self.generation_config = GenerationConfig.from_pretrained(
-            model_path,
-            pad_token_id=self.tokenizer.pad_token_id,
-        )
-        self.tokenizer.eos_token_id = self.generation_config.eos_token_id
-        self.stop_words_ids = []
-
-        self.model = LLM(
+        
+        # 配置生成参数
+        self.generation_config = GenerationConfig.from_pretrained(model_path)
+        
+        # 初始化同步LLM引擎
+        self.llm = LLM(
             model=model_path,
-            tokenizer=model_path, # 如果是多卡，可以自己把这个并行度设置为卡数N
-            tensor_parallel_size=1,
+            tokenizer=model_path,
+            tensor_parallel_size=tensor_parallel_size,
             trust_remote_code=True,
-            gpu_memory_utilization=0.6, # 可以根据gpu的利用率自己调整这个比例
-            dtype="bfloat16"
+            gpu_memory_utilization=0.85,
+            dtype="auto",
+            max_model_len=8192,
+        )
+        
+        # 默认采样参数
+        self.sampling_params = SamplingParams(
+            temperature=0.7,
+            top_p=0.9,
+            max_tokens=1024,
+            presence_penalty=0.1,
+            frequency_penalty=0.1,
+            stop_token_ids=[self.tokenizer.eos_token_id]
         )
 
-        for stop_id in get_stop_words_ids(self.generation_config.chat_format, self.tokenizer):
-            self.stop_words_ids.extend(stop_id)
-        self.stop_words_ids.extend([self.generation_config.eos_token_id])
-    
-        # LLM的采样参数
-        sampling_kwargs = {
-            "stop_token_ids": self.stop_words_ids,
-            "early_stopping": False,
-            "top_p": 1.0,
-            "top_k": -1 if self.generation_config.top_k == 0 else self.generation_config.top_k,
-            "temperature": 0.0,
-            "max_tokens": 2000,
-            "repetition_penalty": self.generation_config.repetition_penalty,
-            "n":1,
-            "best_of":2,
-            "use_beam_search":True
-        }
-        self.sampling_params = SamplingParams(**sampling_kwargs)
+    def build_chat_prompt(self, messages):
+        """构建Qwen对话提示"""
+        prompt = ""
+        for message in messages:
+            if message["role"] == "system":
+                prompt += f"<|im_start|>system\n{message['content']}<|im_end|>\n"
+            elif message["role"] == "user":
+                prompt += f"<|im_start|>user\n{message['content']}<|im_end|>\n"
+            elif message["role"] == "assistant":
+                prompt += f"<|im_start|>assistant\n{message['content']}<|im_end|>\n"
+        prompt += "<|im_start|>assistant\n"
+        return prompt
 
-    # 批量推理，输入一个batch，返回一个batch的答案
-    def infer(self, prompts):
-        batch_text = []
-        for q in prompts:
-            raw_text, _ = make_context(
-                self.tokenizer, 
-                q,
-                system="You are a helpful assistant.",
-                max_window_size=self.generation_config.max_window_size,
-                chat_format=self.generation_config.chat_format,
-            )
-            batch_text.append(raw_text)
+    def generate_sync(self, prompts, sampling_params=None):
+        """同步批量推理"""
+        params = sampling_params or self.sampling_params
+        outputs = self.llm.generate(prompts, params)
+        return [output.outputs[0].text for output in outputs]
 
-        outputs = self.model.generate(
-            batch_text,
-            sampling_params=self.sampling_params,
+    async def generate_async(self, prompts, sampling_params=None):
+        """异步批量推理"""
+        params = sampling_params or self.sampling_params
+        
+        # 创建异步引擎
+        engine_args = AsyncEngineArgs(
+            model=self.model_path,
+            tokenizer=self.model_path,
+            tensor_parallel_size=self.tensor_parallel_size,
+            trust_remote_code=True,
+            gpu_memory_utilization=0.85,
+            dtype="auto",
+            max_model_len=8192,
         )
-        batch_response = []
-        for output in outputs:
-            output_str = output.outputs[0].text
-            if IMEND in output_str:
-                output_str = output_str[:-len(IMEND)]
-            if ENDOFTEXT in output_str:
-                output_str = output_str[:-len(ENDOFTEXT)]
-            batch_response.append(output_str)
-        torch_gc()
-        return batch_response
+        engine = AsyncLLMEngine.from_engine_args(engine_args)
+        
+        # 生成任务
+        tasks = [engine.generate(prompt, params) for prompt in prompts]
+        
+        # 等待所有任务完成
+        outputs = await asyncio.gather(*tasks)
+        return [output.outputs[0].text for output in outputs]
 
+    def batch_infer(self, queries, system_prompt=None):
+        """批量推理便捷方法"""
+        system = system_prompt or "你是一个有帮助的AI助手。"
+        prompts = [
+            self.build_chat_prompt([
+                {"role": "system", "content": system},
+                {"role": "user", "content": query}
+            ])
+            for query in queries
+        ]
+        return self.generate_sync(prompts)
+
+    def release(self):
+        """显式释放资源"""
+        if hasattr(self, 'llm'):
+            del self.llm
+        torch.cuda.empty_cache()
+
+# 示例使用
 if __name__ == "__main__":
-    qwen7 = "pre_train_model/Qwen-7b-Chat"
-    start = time.time()
-    llm = ChatLLM(qwen7)
-    test = ["吉利汽车座椅按摩","吉利汽车语音组手唤醒","自动驾驶功能介绍"]
-    generated_text = llm.infer(test)
-    print(generated_text)
-    end = time.time()
-    print("cos time:", (end - start)/60)
+    # 配置参数
+    model_path = "/root/autodl-tmp/carQASystem/pre_train_model/Qwen-7B-Chat"
+    tensor_parallel_size = 2  # 使用2张GPU卡
+    
+    # 初始化模型
+    print(f"Initializing Qwen-7B-Chat on {tensor_parallel_size} GPUs...")
+    start_time = time.time()
+    model = Qwen7BChatModel(model_path, tensor_parallel_size)
+    print(f"Model loaded in {time.time()-start_time:.2f}s")
+
+    # 测试1: 同步批量推理
+    print("\n=== 测试同步批量推理 ===")
+    test_queries = [
+        "解释吉利汽车的座椅按摩功能",
+        "如何唤醒吉利汽车的语音助手？",
+        "详细说明自动驾驶功能的技术原理",
+    ]
+    
+    start_time = time.time()
+    responses = model.batch_infer(test_queries)
+    for query, response in zip(test_queries, responses):
+        print(f"\nQ: {query}\nA: {response[:200]}...")
+    print(f"\n批量推理耗时: {time.time()-start_time:.2f}s")
+
+    # # 测试2: 异步推理
+    # print("\n=== 测试异步推理 ===")
+    # async def test_async():
+    #     messages = [
+    #         {"role": "system", "content": "你是一个汽车专家助手。"},
+    #         {"role": "user", "content": "吉利汽车的智能座舱有哪些特点？"}
+    #     ]
+    #     prompt = model.build_chat_prompt(messages)
+    #     responses = await model.generate_async([prompt])
+    #     print(responses[0])
+    
+    # asyncio.run(test_async())
+
+    # 释放资源
+    model.release()
