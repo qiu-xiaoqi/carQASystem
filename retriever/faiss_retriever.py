@@ -17,7 +17,7 @@ class FaissRetriever(object):
 
         # 如果已有向量索引文件，则直接加载
         if os.path.exists(self.vector_path):
-            print(f"加载已有Faiss索引从 {self.vector_path}")
+            print(f"从 {self.vector_path}加载已有Faiss索引")
             self.vector_store = FAISS.load_local(self.vector_path, self.embeddings)
         else:
             # 否则创建新索引
@@ -72,7 +72,9 @@ class FaissRetriever(object):
         return context
 
     def getVectorStore(self):
-        self.vector_store = FAISS.load_local("faiss_index", self.embeddings)
+        self.vector_store = FAISS.load_local(self.vector_path, 
+                                             self.embeddings,
+                                             allow_dangerous_deserialization=True)
         return self.vector_store
     
 
@@ -93,7 +95,7 @@ if __name__ == "__main__":
         )
 
     # 查询
-    results = retriever.getTopK("如何预防新冠肺炎", k=3)
+    results = retriever.getTopK("座椅加热", k=3)
     print(results)
 
     # # 更新索引

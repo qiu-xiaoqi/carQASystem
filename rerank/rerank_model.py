@@ -1,6 +1,7 @@
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 import os
-
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from retriever.bm25_retriever import BM25
 from pdf_parse import DataProcess
 from config import *
@@ -54,7 +55,7 @@ if __name__ == "__main__":
 
     bm25 = BM25(data_list)
     res = bm25.getBM25TopK("座椅加热", topk=6)
-
+    
     reranked_res = reranker.predict("座椅加热", res)
     print(reranked_res)
     
