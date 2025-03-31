@@ -1,218 +1,117 @@
 import json
-import jieba
-import pandas as pd
-import numpy as np
-from tqdm import tqdm
-from langchain.schema import Document
-from langchain.vectorstores import FAISS, Chroma
-from langchain import PromptTemplate, LLMChain
-from langchain.chains import RetrievalQA
 import time
-import re
-
-from vllm_model import ChatLLM
+from vllm_model import Qwen7BChatModel
 from rerank.rerank_model import reRankLLM
-from retriever.faiss_retriever import FaissRetriever
+from retriever.chroma_retriever import ChromaRetriever
 from retriever.bm25_retriever import BM25
-from pdf_parse import DataProcess
 
-# 获取langchain工具链
-def get_qa_chain(llm, vector_store, prompt_template):
-    prompt = PromptTemplate(
-        template=prompt_template, 
-        input_variables=["context", "question"]
-    )
-
-    return RetrievalQA.from_llm(
-            llm=llm, 
-            retriever=vector_store.as_retriever(search_kwargs={"k": 10}), 
-            prompt=prompt
-            )
-
-
-# 构造提示，根据merged faiss和bm25的召回结果返回答案
 def get_emb_bm25_merge(faiss_context, bm25_context, query):
+    """合并FAISS和BM25召回结果构造prompt"""
     max_length = 2500
     emb_ans = ""
-    cnt = 0
-    for doc, score in faiss_context:
-        cnt = cnt + 1
-        if cnt > 6:
-            break
+    for doc, score in faiss_context[:6]:
         if len(emb_ans + doc.page_content) > max_length:
             break
-        emb_ans = emb_ans + doc.page_content
+        emb_ans += doc.page_content
+    
     bm25_ans = ""
-    cnt = 0
-    for doc in bm25_context:
-        cnt = cnt + 1
+    for doc in bm25_context[:6]:
         if len(bm25_ans + doc.page_content) > max_length:
             break
-        bm25_ans = bm25_ans + doc.page_content
-        if cnt > 6:
-            break
+        bm25_ans += doc.page_content
     
-    prompt_template = """基于以下已知信息，简洁和专业的来回答用户的问题。
-                                如果无法从中得到答案，请说 "无答案"或"无答案"，不允许在答案中添加编造成分，答案请使用中文。
-                                已知内容为吉利控股集团汽车销售有限公司的吉利用户手册:
-                                1: {emb_ans}
-                                2: {bm25_ans}
-                                问题:
-                                {question}""".format(emb_ans=emb_ans, bm25_ans = bm25_ans, question = query)
-    
-    return prompt_template
+    return f"""基于以下已知信息，简洁和专业的来回答用户的问题。
+            如果无法从中得到答案，请说"无答案"，不允许在答案中添加编造成分。
+            已知内容为吉利控股集团汽车销售有限公司的吉利用户手册:
+            1: {emb_ans}
+            2: {bm25_ans}
+            问题: {query}"""
 
-
-def get_rerank(emb_ans, query):
-    prompt_template = """基于以下已知信息，简洁和专业的来回答用户的问题。
-                                如果无法从中得到答案，请说 "无答案"或"无答案" ，不允许在答案中添加编造成分，答案请使用中文。
-                                已知内容为吉利控股集团汽车销售有限公司的吉利用户手册:
-                                1: {emb_ans}
-                                问题:
-                                {question}""".format(emb_ans=emb_ans, question = query)
-    return prompt_template
-
-def question(text, llm, vector_store, prompt_template):
-
-    chain = get_qa_chain(llm, vector_store, prompt_template)
-
-    response = chain({"query": text})
-    return response
-
+def get_rerank(context, query):
+    """构造重排序后的prompt"""
+    return f"""基于以下已知信息，简洁和专业的来回答用户的问题。
+            如果无法从中得到答案，请说"无答案"，不允许在答案中添加编造成分。
+            已知内容为吉利控股集团汽车销售有限公司的吉利用户手册:
+            1: {context}
+            问题: {query}"""
 
 def reRank(rerank, top_k, query, bm25_ans, faiss_ans):
-    items = []
+    """重排序并合并结果"""
     max_length = 4000
-    for doc, score in faiss_ans:
-        items.append(doc)
-    items.extend(bm25_ans)
-    rerank_ans = rerank.predict(query, items)
-    rerank_ans = rerank_ans[:top_k]
-    # docs_sort = sorted(rerank_ans, key = lambda x:x.metadata["id"])
-    emb_ans = ""
-    for doc in rerank_ans:
-        if len(emb_ans + doc.page_content) > max_length:
-            break
-        emb_ans = emb_ans + doc.page_content
-    return emb_ans
+    items = [doc for doc, score in faiss_ans] + bm25_ans
+    rerank_ans = rerank.predict(query, items)[:top_k]
+    return "".join(doc.page_content for doc in rerank_ans[:6] 
+                  if len(doc.page_content) <= max_length)
 
+def load_data(text_path):
+    """加载文本数据"""
+    with open(text_path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+def main():
+    start = time.time()
+    base = "."
+    
+    # 初始化模型
+    print("Initializing models...")
+    chromaretriever = ChromaRetriever(
+        model_path=f"{base}/pre_train_model/m3e-large",
+        data=load_data("all_text.txt"),
+        vector_path="chroma_db"
+    )
+    bm25 = BM25(load_data("all_text.txt"))
+    llm = Qwen7BChatModel(
+        f"{base}/pre_train_model/Qwen-7B-Chat",
+        tensor_parallel_size=2
+    )
+    rerank = reRankLLM(f"{base}/pre_train_model/bge-reranker-large")
+    
+    # 加载测试问题
+    with open(f"{base}/data/test_question.json", "r", encoding="utf-8") as f:
+        test_data = json.load(f)
+    
+    # 处理每个问题
+    for item in test_data:
+        query = item["question"]
+        
+        # 获取召回结果
+        chroma_context = chromaretriever.getTopK(query, k=15)
+        bm25_context = bm25.getBM25TopK(query, topk=15)
+        
+        # 准备各种prompt
+        batch_inputs = [
+            get_emb_bm25_merge(chroma_context, bm25_context, query),  # 合并召回
+            get_rerank(
+                "".join(doc.page_content for doc in bm25_context[:6]), 
+                query
+            ),  # BM25
+            get_rerank(
+                "".join(doc.page_content for doc, _ in chroma_context[:6]), 
+                query
+            ),  # 向量召回
+            get_rerank(
+                reRank(rerank, 6, query, bm25_context, chroma_context), 
+                query
+            )  # 重排序
+        ]
+        
+        # 批量推理
+        batch_output = llm.batch_infer(batch_inputs)
+        
+        # 保存结果
+        item.update({
+            "answer_1": batch_output[0],  # 合并召回
+            "answer_2": batch_output[1],  # BM25
+            "answer_3": batch_output[2],  # 向量召回
+            "answer_4": batch_output[3],  # 重排序
+            "chroma_score": chroma_context[0][1] if chroma_context else 0
+        })
+    
+    # 保存结果
+    with open(f"{base}/data/result.json", "w", encoding="utf-8") as f:
+        json.dump(test_data, f, ensure_ascii=False, indent=2)
+    
+    print(f"Total time: {(time.time()-start)/60:.2f} minutes")
 
 if __name__ == "__main__":
-    start = time.time()
-
-    base = "."
-    qwen7 = base + "/pre_train_model/Qwen-7B-Chat"
-    m3e =  base + "/pre_train_model/m3e-large"
-    bge_reranker_large = base + "/pre_train_model/bge-reranker-large"
-
-    # 解析pdf文档，构造数据
-    dp =  DataProcess(pdf_path = base + "/data/train_a.pdf")
-    dp.ParseBlock(max_seq = 1024)
-    dp.ParseBlock(max_seq = 512)
-    print(len(dp.data))
-    dp.ParseAllPage(max_seq = 256)
-    dp.ParseAllPage(max_seq = 512)
-    print(len(dp.data))
-    dp.ParseOnePageWithRule(max_seq = 256)
-    dp.ParseOnePageWithRule(max_seq = 512)
-    print(len(dp.data))
-    data = dp.data
-    print("data load ok")
-
-    # Faiss召回
-    faissretriever = FaissRetriever(m3e, data)
-    vector_store = faissretriever.vector_store
-    print("faissretriever load ok")
-
-    # BM25召回
-    bm25 = BM25(data)
-    print("bm25 load ok")
-
-    # LLM大模型
-    llm = ChatLLM(qwen7)
-    print("llm qwen load ok")
-
-    # reRank模型
-    rerank = reRankLLM(bge_reranker_large)
-    print("rerank model load ok")
-
-
-    with open(base + "/data/test.json", "r", encoding="utf-8") as f:
-        jdata = json.load(f.read())
-        print(len(jdata))
-        max_length = 4000
-        for idx, line in enumerate(jdata):
-            query = line["query"]
-
-            # faiss召回topk
-            faiss_context = faissretriever.getTopK(query, k=15)
-            faiss_min_score = 0.0
-            if len(faiss_context) > 0:
-                faiss_min_score = faiss_context[0][1]
-            cnt = 0
-            emb_ans = ""
-
-            for doc, score in faiss_context:
-                cnt = cnt + 1
-                if len(emb_ans + doc.page_content) > max_length:
-                    break
-                emb_ans = emb_ans + doc.page_content
-
-                if cnt>6:
-                    break
-
-            # bm25召回topk
-            bm25_context = bm25.getBM25TopK(query, topk=15)
-            bm25_ans = ""
-            cnt = 0
-            for doc in bm25_context:
-                cnt = cnt + 1
-                if(len(bm25_ans + doc.page_content) > max_length):
-                    break
-                bm25_ans = bm25_ans + doc.page_content
-                if(cnt > 6):
-                    break
-            
-            # 构造合并bm25召回和向量召回的prompt
-            emb_bm25_merge_inputs = get_emb_bm25_merge(faiss_context, bm25_context, query)
-
-            # 构造bm25召回的prompt
-            bm25_inputs = get_rerank(bm25_ans, query)
-
-            # 构造向量召回的prompt
-            emb_inputs = get_rerank(emb_ans, query)
-
-
-            # rerank召回的候选，并按照相关性得分排序
-            rerank_ans = reRank(rerank, 6, query, bm25_context, faiss_context)
-            # 构造得到rerank后生成答案的prompt
-            rerank_inputs = get_rerank(rerank_ans, query)
-
-            batch_input = []
-            batch_input.append(emb_bm25_merge_inputs)
-            batch_input.append(bm25_inputs)
-            batch_input.append(emb_inputs)
-            batch_input.append(rerank_inputs)
-
-
-            # 执行batch推理
-            batch_output = llm.infer(batch_input)
-            line["answer_1"] = batch_output[0] # 合并两路召回的结果
-            line["answer_2"] = batch_output[1] # bm召回的结果
-            line["answer_3"] = batch_output[2] # 向量召回的结果
-            line["answer_4"] = batch_output[3] # 多路召回重排序后的结果
-            line["answer_5"] = emb_ans
-            line["answer_6"] = bm25_ans
-            line["answer_7"] = rerank_ans
-            # 如果faiss检索跟query的距离高于500，输出无答案
-            if(faiss_min_score >500):
-                line["answer_5"] = "无答案"
-            else:
-                line["answer_5"] = str(faiss_min_score)
-
-        # 保存结果，生成submission文件
-        json.dump(jdata, open(base + "/data/result.json", "w", encoding='utf-8'), ensure_ascii=False, indent=2)
-        end = time.time()
-        print("cost time: " + str(int(end-start)/60))
-
-            
+    main()
